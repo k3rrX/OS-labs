@@ -1,22 +1,29 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
-#include <semaphore.h>
 #include <time.h>
-#include <unistd.h>  // Для getopt
-#include <getopt.h>  // Для расширенного парсинга
+#include <unistd.h>
+#include <getopt.h>
+#include <sys/sysinfo.h>
+#include <string.h>
 
-#define MIN_RUN 32
+// ==================== КОНСТАНТЫ ====================
+#define MIN_MERGE 32
+#define MAX_THREADS 64
+#define MIN_PARALLEL_SIZE 100000  // Минимальный размер для параллельной сортировки
 
-// Структура для передачи данных в поток
+// ==================== СТРУКТУРЫ ====================
 typedef struct {
     int* array;
-    int left;
-    int right;
-    sem_t* sem;
+    int start;
+    int end;
+    int thread_id;
 } ThreadData;
 
-// Функция сортировки вставками
+// ==================== УТИЛИТЫ ====================
+int min(int a, int b) { return a < b ? a : b; }
+
+// ==================== СОРТИРОВКА ВСТАВКАМИ ====================
 void insertion_sort(int arr[], int left, int right) {
     for (int i = left + 1; i <= right; i++) {
         int key = arr[i];
@@ -29,65 +36,227 @@ void insertion_sort(int arr[], int left, int right) {
     }
 }
 
-// Функция, выполняемая в потоке
-void* sort_thread(void* arg) {
+// ==================== СЛИЯНИЕ ====================
+void merge(int arr[], int left, int mid, int right) {
+    int n1 = mid - left + 1;
+    int n2 = right - mid;
+    
+    int* L = malloc(n1 * sizeof(int));
+    int* R = malloc(n2 * sizeof(int));
+    
+    for (int i = 0; i < n1; i++) L[i] = arr[left + i];
+    for (int j = 0; j < n2; j++) R[j] = arr[mid + 1 + j];
+    
+    int i = 0, j = 0, k = left;
+    while (i < n1 && j < n2) {
+        if (L[i] <= R[j]) arr[k++] = L[i++];
+        else arr[k++] = R[j++];
+    }
+    
+    while (i < n1) arr[k++] = L[i++];
+    while (j < n2) arr[k++] = R[j++];
+    
+    free(L);
+    free(R);
+}
+
+// ==================== TIMSORT (однопоточный) ====================
+void timsort_single(int arr[], int n) {
+    // Сортировка маленьких runs
+    for (int i = 0; i < n; i += MIN_MERGE) {
+        insertion_sort(arr, i, min(i + MIN_MERGE - 1, n - 1));
+    }
+    
+    // Слияние runs
+    for (int size = MIN_MERGE; size < n; size = 2 * size) {
+        for (int left = 0; left < n; left += 2 * size) {
+            int mid = left + size - 1;
+            int right = min(left + 2 * size - 1, n - 1);
+            
+            if (mid < right) {
+                merge(arr, left, mid, right);
+            }
+        }
+    }
+}
+
+// ==================== ПОТОКОВАЯ ФУНКЦИЯ (Timsort части) ====================
+void* timsort_thread(void* arg) {
     ThreadData* data = (ThreadData*)arg;
     
-    // Сортируем свою часть
-    insertion_sort(data->array, data->left, data->right);
+    // Применяем TimSort к своей части массива
+    int n = data->end - data->start + 1;
     
-    // Освобождаем семафор
-    sem_post(data->sem);
+    // Сортировка маленьких runs
+    for (int i = data->start; i <= data->end; i += MIN_MERGE) {
+        insertion_sort(data->array, i, min(i + MIN_MERGE - 1, data->end));
+    }
     
-    pthread_exit(NULL);
+    // Слияние runs внутри части
+    for (int size = MIN_MERGE; size < n; size = 2 * size) {
+        for (int left = data->start; left <= data->end; left += 2 * size) {
+            int mid = left + size - 1;
+            int right = min(left + 2 * size - 1, data->end);
+            
+            if (mid < right && mid <= data->end && right <= data->end) {
+                merge(data->array, left, mid, right);
+            }
+        }
+    }
+    
+    free(data);
+    return NULL;
 }
 
-// Функция вывода справки
-void print_help() {
-    printf("Использование: ./parallel_timsort [OPTIONS]\n");
-    printf("Параллельная сортировка TimSort\n\n");
-    printf("Опции:\n");
-    printf("  -n, --size SIZE     Размер массива (по умолчанию: 1000000)\n");
-    printf("  -t, --threads NUM   Количество потоков (по умолчанию: 4)\n");
-    printf("  -s, --seed SEED     Сид для генератора случайных чисел\n");
-    printf("  -c, --check         Проверить корректность сортировки\n");
-    printf("  -h, --help          Показать эту справку\n");
-    printf("\nПримеры:\n");
-    printf("  ./parallel_timsort -n 1000000 -t 4\n");
-    printf("  ./parallel_timsort --size 500000 --threads 2 --check\n");
+// ==================== МНОГОПОТОЧНЫЙ TIMSORT ====================
+void timsort_parallel(int arr[], int n, int max_threads) {
+    printf("\n=== ПАРАЛЛЕЛЬНАЯ СОРТИРОВКА TIMSORT ===\n");
+    printf("Всего элементов: %d\n", n);
+    printf("Используется потоков: %d\n", max_threads);
+    printf("MIN_MERGE: %d\n", MIN_MERGE);
+    
+    pthread_t threads[MAX_THREADS];
+    int thread_count = 0;
+    
+    // Разделение массива между потоками
+    int chunk_size = n / max_threads;
+    
+    for (int i = 0; i < max_threads; i++) {
+        ThreadData* data = malloc(sizeof(ThreadData));
+        data->array = arr;
+        data->start = i * chunk_size;
+        data->end = (i == max_threads - 1) ? n - 1 : (i + 1) * chunk_size - 1;
+        data->thread_id = i + 1;
+        
+        if (pthread_create(&threads[thread_count], NULL, timsort_thread, data) == 0) {
+            thread_count++;
+        } else {
+            free(data);
+        }
+    }
+    
+    // Ожидание завершения потоков
+    for (int i = 0; i < thread_count; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    
+    // Слияние отсортированных частей
+    printf("Слияние отсортированных частей...\n");
+    for (int size = chunk_size; size < n; size = 2 * size) {
+        for (int left = 0; left < n; left += 2 * size) {
+            int mid = left + size - 1;
+            int right = min(left + 2 * size - 1, n - 1);
+            
+            if (mid < right) {
+                merge(arr, left, mid, right);
+            }
+        }
+    }
 }
 
+// ==================== УМНЫЙ ВЫБОР РЕЖИМА ====================
+void smart_timsort(int arr[], int n, int max_threads) {
+    // Для маленьких массивов используем однопоточный режим
+    if (n < MIN_PARALLEL_SIZE || max_threads == 1) {
+        printf("Используется однопоточный режим (массив слишком мал)\n");
+        timsort_single(arr, n);
+        return;
+    }
+    
+    // Ограничиваем количество потоков разумным значением
+    int optimal_threads = max_threads;
+    int cpu_cores = get_nprocs();
+    
+    if (optimal_threads > cpu_cores * 2) {
+        optimal_threads = cpu_cores * 2;
+        printf("Ограничение потоков: %d -> %d (оптимально для %d ядер)\n", 
+               max_threads, optimal_threads, cpu_cores);
+    }
+    
+    timsort_parallel(arr, n, optimal_threads);
+}
+
+// ==================== ПРОВЕРКА СОРТИРОВКИ ====================
+int is_sorted(int arr[], int n) {
+    for (int i = 1; i < n; i++) {
+        if (arr[i] < arr[i-1]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// ==================== ПОКАЗАТЬ ИНФОРМАЦИЮ О ПОТОКАХ ====================
+void show_threads_info() {
+    printf("\n=== ИНФОРМАЦИЯ О СИСТЕМЕ ===\n");
+    printf("PID процесса: %d\n", getpid());
+    printf("Количество ядер CPU: %d\n", get_nprocs());
+    
+    printf("\nКоманды для мониторинга потоков:\n");
+    printf("1. ps -T -p %d\n", getpid());
+    printf("2. top -H -p %d\n", getpid());
+    
+    printf("\nТекущие потоки системы:\n");
+    char command[100];
+    snprintf(command, sizeof(command), "ps -L -p %d 2>/dev/null | head -10", getpid());
+    system(command);
+}
+
+// ==================== ЗАПОЛНЕНИЕ МАССИВА ====================
+void fill_array(int arr[], int n, unsigned int seed) {
+    srand(seed);
+    for (int i = 0; i < n; i++) {
+        arr[i] = rand() % (n * 10);
+    }
+}
+
+// ==================== ВЫВОД СПРАВКИ ====================
+void print_usage(const char* program_name) {
+    printf("Использование: %s [ОПЦИИ]\n", program_name);
+    printf("Параллельная сортировка TimSort с интеллектуальным выбором режима\n\n");
+    
+    printf("Обязательные опции:\n");
+    printf("  -n SIZE      Размер массива (например: 1000000)\n");
+    printf("  -t THREADS   Максимальное количество потоков (например: 4)\n\n");
+    
+    printf("Дополнительные опции:\n");
+    printf("  -s SEED      Сид для генератора случайных чисел\n");
+    printf("  -c           Проверить корректность сортировки\n");
+    printf("  -p NUM       Вывести первые NUM элементов\n");
+    printf("  -i           Показать информацию о потоках системы\n");
+    printf("  -h           Показать эту справку\n\n");
+    
+    printf("Примеры:\n");
+    printf("  %s -n 1000000 -t 4\n", program_name);
+    printf("  %s -n 500000 -t 2 -c -p 10\n", program_name);
+    printf("  %s -i\n", program_name);
+}
+
+// ==================== ГЛАВНАЯ ФУНКЦИЯ ====================
 int main(int argc, char* argv[]) {
-    // Параметры по умолчанию
-    int array_size = 1000000;
-    int num_threads = 4;
-    int check_result = 0;
+    // Параметры
+    int array_size = 0;
+    int max_threads = 0;
     unsigned int seed = time(NULL);
+    int check_sort = 0;
+    int print_elements = 0;
+    int show_info = 0;
     
-    // Парсинг аргументов командной строки
+    // Парсинг аргументов
     int opt;
-    static struct option long_options[] = {
-        {"size", required_argument, 0, 'n'},
-        {"threads", required_argument, 0, 't'},
-        {"seed", required_argument, 0, 's'},
-        {"check", no_argument, 0, 'c'},
-        {"help", no_argument, 0, 'h'},
-        {0, 0, 0, 0}
-    };
-    
-    while ((opt = getopt_long(argc, argv, "n:t:s:ch", long_options, NULL)) != -1) {
+    while ((opt = getopt(argc, argv, "n:t:s:cp:ih")) != -1) {
         switch (opt) {
             case 'n':
                 array_size = atoi(optarg);
                 if (array_size <= 0) {
-                    fprintf(stderr, "Ошибка: размер массива должен быть положительным\n");
+                    fprintf(stderr, "Ошибка: размер массива должен быть > 0\n");
                     return 1;
                 }
                 break;
             case 't':
-                num_threads = atoi(optarg);
-                if (num_threads <= 0) {
-                    fprintf(stderr, "Ошибка: количество потоков должно быть положительным\n");
+                max_threads = atoi(optarg);
+                if (max_threads <= 0 || max_threads > MAX_THREADS) {
+                    fprintf(stderr, "Ошибка: количество потоков должно быть от 1 до %d\n", MAX_THREADS);
                     return 1;
                 }
                 break;
@@ -95,125 +264,90 @@ int main(int argc, char* argv[]) {
                 seed = atoi(optarg);
                 break;
             case 'c':
-                check_result = 1;
+                check_sort = 1;
+                break;
+            case 'p':
+                print_elements = atoi(optarg);
+                break;
+            case 'i':
+                show_info = 1;
                 break;
             case 'h':
-                print_help();
+                print_usage(argv[0]);
                 return 0;
             default:
-                fprintf(stderr, "Используйте -h или --help для справки\n");
+                fprintf(stderr, "Неизвестная опция. Используйте -h для справки\n");
                 return 1;
         }
     }
     
-    // Вывод информации о параметрах
-    printf("=== Параллельная сортировка TimSort ===\n");
-    printf("Размер массива: %d\n", array_size);
-    printf("Количество потоков: %d\n", num_threads);
-    printf("Сид генератора: %u\n", seed);
-    printf("Минимальный размер 'рана': %d\n", MIN_RUN);
+    // Режим показа информации о потоках
+    if (show_info) {
+        show_threads_info();
+        return 0;
+    }
     
-    // Инициализация генератора случайных чисел
-    srand(seed);
+    // Проверка обязательных параметров
+    if (array_size == 0 || max_threads == 0) {
+        fprintf(stderr, "\nОшибка: необходимо указать размер массива (-n) и количество потоков (-t)\n");
+        fprintf(stderr, "Пример: %s -n 1000000 -t 4\n\n", argv[0]);
+        print_usage(argv[0]);
+        return 1;
+    }
     
-    // Выделение памяти для массива
+    printf("========================================\n");
+    printf("Лабораторная работа №2: Параллельный TimSort\n");
+    printf("========================================\n");
+    
+    // Выделение памяти
     int* array = malloc(array_size * sizeof(int));
     if (!array) {
         perror("Ошибка выделения памяти");
         return 1;
     }
     
-    // Заполнение массива случайными числами
-    printf("Заполнение массива...\n");
-    for (int i = 0; i < array_size; i++) {
-        array[i] = rand() % 1000000;
-    }
+    // Заполнение массива
+    printf("Заполнение массива (%d элементов)...\n", array_size);
+    fill_array(array, array_size, seed);
     
-    // Создание семафора для ограничения потоков
-    sem_t thread_sem;
-    sem_init(&thread_sem, 0, num_threads);
+    // Замер времени
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
     
-    // Подготовка данных для потоков
-    pthread_t* threads = malloc(num_threads * sizeof(pthread_t));
-    ThreadData* thread_data = malloc(num_threads * sizeof(ThreadData));
+    // Умная сортировка
+    smart_timsort(array, array_size, max_threads);
     
-    if (!threads || !thread_data) {
-        perror("Ошибка выделения памяти для потоков");
-        free(array);
-        return 1;
-    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double time_taken = (end.tv_sec - start.tv_sec) + 
+                       (end.tv_nsec - start.tv_nsec) / 1e9;
     
-    // Замер времени начала
-    struct timespec start_time, end_time;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
+    printf("\n=== РЕЗУЛЬТАТЫ ===\n");
+    printf("Время выполнения: %.3f секунд\n", time_taken);
+    printf("Скорость: %.0f элементов/сек\n", array_size / time_taken);
     
-    // Разделение массива на части для потоков
-    int chunk_size = array_size / num_threads;
-    printf("Запуск %d потоков...\n", num_threads);
-    
-    // Создание и запуск потоков
-    for (int i = 0; i < num_threads; i++) {
-        sem_wait(&thread_sem);  // Ожидание свободного "слота" для потока
-        
-        thread_data[i].array = array;
-        thread_data[i].left = i * chunk_size;
-        thread_data[i].right = (i == num_threads - 1) ? array_size - 1 : (i + 1) * chunk_size - 1;
-        thread_data[i].sem = &thread_sem;
-        
-        if (pthread_create(&threads[i], NULL, sort_thread, &thread_data[i]) != 0) {
-            perror("Ошибка создания потока");
-            free(array);
-            free(threads);
-            free(thread_data);
-            return 1;
-        }
-    }
-    
-    // Ожидание завершения всех потоков
-    for (int i = 0; i < num_threads; i++) {
-        pthread_join(threads[i], NULL);
-    }
-    
-    // Замер времени окончания
-    clock_gettime(CLOCK_MONOTONIC, &end_time);
-    
-    // Вычисление времени выполнения
-    double execution_time = (end_time.tv_sec - start_time.tv_sec) +
-                           (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
-    
-    printf("Сортировка завершена за %.3f секунд\n", execution_time);
-    
-    // Проверка корректности сортировки (если запрошено)
-    if (check_result) {
-        printf("Проверка корректности сортировки...\n");
-        int sorted = 1;
-        for (int i = 1; i < array_size; i++) {
-            if (array[i] < array[i-1]) {
-                printf("Ошибка: элемент %d[%d] > %d[%d]\n", 
-                       array[i-1], i-1, array[i], i);
-                sorted = 0;
-                break;
-            }
-        }
-        if (sorted) {
-            printf("✓ Массив отсортирован корректно\n");
+    // Проверка сортировки
+    if (check_sort) {
+        printf("Проверка корректности сортировки... ");
+        if (is_sorted(array, array_size)) {
+            printf("✓ УСПЕШНО\n");
         } else {
-            printf("✗ Массив отсортирован НЕ корректно\n");
+            printf("✗ ОШИБКА\n");
         }
     }
     
-    // Вывод первых 10 элементов для проверки
-    printf("Первые 10 элементов: ");
-    for (int i = 0; i < 10 && i < array_size; i++) {
-        printf("%d ", array[i]);
+    // Вывод элементов
+    if (print_elements > 0) {
+        printf("Первые %d элементов: ", print_elements);
+        int limit = min(print_elements, array_size);
+        for (int i = 0; i < limit; i++) {
+            printf("%d ", array[i]);
+        }
+        printf("\n");
     }
-    printf("\n");
     
-    // Освобождение ресурсов
+    // Освобождение памяти
     free(array);
-    free(threads);
-    free(thread_data);
-    sem_destroy(&thread_sem);
     
+    printf("\nРабота завершена успешно!\n");
     return 0;
 }
