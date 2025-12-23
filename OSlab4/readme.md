@@ -22,11 +22,13 @@ make all
 
 Запуск
 
+cd OSlab4
+
 # Программа 1 (compile-time linking)
 ./program1
 
 # Программа 2 (runtime linking)
-LD_LIBRARY_PATH=./build ./program2
+./program2
 
 # Или тестируем всё
 make test
@@ -49,3 +51,4 @@ OSlab4/
 Янкавцев К.Г.
 Группа: М8О-209БВ-24
 20.12.25
+
