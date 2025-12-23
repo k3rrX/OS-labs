@@ -87,4 +87,6 @@ test_file.txt
 
 И запусти с ним: ./src/parent, затем введи my_numbers.txt (сумма должна быть 145).
 
-
+cd ~/OS-labs/OSlab1/src
+./parent
+../test_file.txt
